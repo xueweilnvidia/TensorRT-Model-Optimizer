@@ -44,6 +44,8 @@ import torch
 from diffusers.models.attention_processor import Attention
 from optimum.onnx.utils import _get_onnx_external_data_tensors, check_model_uses_external_data
 from torch.onnx import export as onnx_export
+import onnx_graphsurgeon as gs
+
 
 AXES_NAME = {
     "sdxl-1.0": {
@@ -75,6 +77,16 @@ AXES_NAME = {
         "pooled_projections": {0: "batch_size"},
         "sample": {0: "batch_size", 1: "num_channels", 2: "height", 3: "width"},
     },
+    "flux-dev":{
+        'hidden_states': {0: 'batch_size', 1: 'sequence'},
+        'encoder_hidden_states': {0: 'batch_size'},
+        'pooled_projections': {0: 'batch_size'},
+        'timestep': {0: 'batch_size'},
+        'img_ids': {0: 'batch_size', 1: 'sequence'},
+        'txt_ids': {0: 'batch_size'},
+        'guidance': {0: 'batch_size'},
+        'output': {0: 'batch_size', 1: 'sequence'}
+    }
 }
 
 # Per-tensor for INT8, we will convert it to FP8 later in onnxgraphsurgeon
@@ -131,10 +143,41 @@ def generate_dummy_inputs(sd_version, device):
         dummy_input["sample"] = torch.ones(2, 4, 64, 64).to(device).half()
         dummy_input["timestep"] = torch.ones(1).to(device).half()
         dummy_input["encoder_hidden_states"] = torch.ones(2, 16, 768).to(device).half()
+    elif sd_version == "flux-dev":
+        dummy_input["hidden_states"] = torch.randn(1, 1024, 64, dtype=torch.bfloat16, device=device)
+        dummy_input["encoder_hidden_states"] = torch.randn(1, 512, 4096, dtype=torch.bfloat16, device=device)
+        dummy_input["pooled_projections"] = torch.randn(1, 768, dtype=torch.bfloat16, device=device)
+        dummy_input["timestep"] = torch.randn(1, dtype=torch.bfloat16, device=device)
+        dummy_input["img_ids"] = torch.randn(1, 1024, 3, dtype=torch.float32, device=device)
+        dummy_input["txt_ids"] = torch.randn(1, 512, 3, dtype=torch.float32, device=device)
+        dummy_input["guidance"] = torch.randn(1, dtype=torch.float32, device=device)
     else:
         raise NotImplementedError(f"Unsupported sd_version: {sd_version}")
 
     return dummy_input
+
+def convert_fp8_qdq(onnx_graph):
+    qdq_zero_nodes = set()
+    # Find all scale and zero constant nodes
+    for node in onnx_graph.graph.node:
+        if node.op_type == "QuantizeLinear":
+            if len(node.input) > 2:
+                qdq_zero_nodes.add(node.input[2])
+
+    print(f"Found {len(qdq_zero_nodes)} QDQ pairs")
+
+    # Convert zero point datatype from int8 to fp8
+    for node in onnx_graph.graph.node:
+        if node.output[0] in qdq_zero_nodes:
+            node.attribute[0].t.data_type = onnx.TensorProto.FLOAT8E4M3FN
+    
+def convert_rope_weight_type(onnx_graph):
+    graph = gs.import_onnx(onnx_graph)
+    for node in graph.nodes:
+        if node.op == "Einsum":
+            node.inputs[1].dtype == "float32"
+            print(node.name)
+    return gs.export_onnx(graph)
 
 
 def modelopt_export_sd(backbone, onnx_dir, model_name):
@@ -151,13 +194,15 @@ def modelopt_export_sd(backbone, onnx_dir, model_name):
     elif model_name == "sd3-medium":
         input_names = ["hidden_states", "encoder_hidden_states", "pooled_projections", "timestep"]
         output_names = ["sample"]
+    elif model_name == "flux-dev":
+        input_names = ["hidden_states", "encoder_hidden_states", "pooled_projections", "timestep", "img_ids", "txt_ids", "guidance"]
+        output_names = ["output"]
     else:
         raise NotImplementedError(f"Unsupported sd_version: {model_name}")
 
     dynamic_axes = AXES_NAME[model_name]
     do_constant_folding = True
     opset_version = 17
-
     # Copied from Huggingface's Optimum
     onnx_export(
         backbone,
@@ -176,6 +221,10 @@ def modelopt_export_sd(backbone, onnx_dir, model_name):
     if model_uses_external_data:
         tensors_paths = _get_onnx_external_data_tensors(onnx_model)
         onnx_model = onnx.load(str(output), load_external_data=True)
+
+        convert_fp8_qdq(onnx_model)
+        onnx_model = convert_rope_weight_type(onnx_model)
+
         onnx.save(
             onnx_model,
             str(output),
